@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reva — Lead Pipeline</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar__left">
+    <div class="topbar__logo">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="6" fill="#3b82f6"/><path d="M8 9h5l3 5-3 5H8l3-5-3-5z" fill="#fff"/><path d="M15 9h5l-3 5 3 5h-5l-3-5 3-5z" fill="rgba(255,255,255,.5)"/></svg>
+      <div>
+        <span class="topbar__title">Reva</span>
+        <span class="topbar__subtitle">Atlantic Horizons · Sales pipeline</span>
+      </div>
+    </div>
+  </div>
+  <div class="topbar__right">
+    <span class="live-dot"></span>
+    <span class="live-label">Live</span>
+    <div class="avatar" id="avatarInitials">AH</div>
+  </div>
+</header>
+
+<section class="kpi-bar" id="kpiBar">
+  <div class="kpi-card">
+    <span class="kpi-label">Total leads</span>
+    <span class="kpi-value" id="kpiTotal">—</span>
+  </div>
+  <div class="kpi-card kpi-card--green">
+    <span class="kpi-label">New today</span>
+    <span class="kpi-value" id="kpiToday">—</span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-label">Qualified</span>
+    <span class="kpi-value" id="kpiQualified">—</span>
+    <span class="kpi-sub" id="kpiQualifiedPct"></span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-label">Meetings booked</span>
+    <span class="kpi-value" id="kpiBooked">—</span>
+  </div>
+  <div class="kpi-card">
+    <span class="kpi-label">Conversion rate</span>
+    <span class="kpi-value" id="kpiConversion">—</span>
+  </div>
+</section>
+
+<main class="layout">
+
+  <section class="pipeline" id="pipeline">
+    <div class="pipeline__col" data-stage="new">
+      <div class="col__header"><span>New</span><span class="col__count" id="countNew">0</span></div>
+      <div class="col__cards" id="colNew"></div>
+    </div>
+    <div class="pipeline__col" data-stage="qualifying">
+      <div class="col__header"><span>Qualifying</span><span class="col__count" id="countQualifying">0</span></div>
+      <div class="col__cards" id="colQualifying"></div>
+    </div>
+    <div class="pipeline__col" data-stage="qualified">
+      <div class="col__header"><span>Qualified</span><span class="col__count" id="countQualified">0</span></div>
+      <div class="col__cards" id="colQualified"></div>
+    </div>
+    <div class="pipeline__col" data-stage="booking">
+      <div class="col__header"><span>Booking</span><span class="col__count" id="countBooking">0</span></div>
+      <div class="col__cards" id="colBooking"></div>
+    </div>
+    <div class="pipeline__col" data-stage="done">
+      <div class="col__header"><span>Meeting booked</span><span class="col__count" id="countDone">0</span></div>
+      <div class="col__cards" id="colDone"></div>
+    </div>
+  </section>
+
+  <aside class="sidebar" id="sidebar">
+
+    <div class="panel" id="panelDetail">
+      <h3 class="panel__title">Lead detail</h3>
+      <div class="detail-placeholder" id="detailPlaceholder">Click a lead card to view details</div>
+      <div class="detail-content hidden" id="detailContent">
+        <div class="detail-grid">
+          <div class="detail-item"><span class="detail-key">Name</span><span class="detail-val" id="detName">—</span></div>
+          <div class="detail-item"><span class="detail-key">Phone</span><span class="detail-val" id="detPhone"></span></div>
+          <div class="detail-item"><span class="detail-key">Source</span><span class="detail-val" id="detSource">—</span></div>
+          <div class="detail-item"><span class="detail-key">Budget</span><span class="detail-val" id="detBudget"></span></div>
+          <div class="detail-item"><span class="detail-key">Location</span><span class="detail-val" id="detLocation"></span></div>
+          <div class="detail-item"><span class="detail-key">Type</span><span class="detail-val" id="detType"></span></div>
+          <div class="detail-item"><span class="detail-key">Timeline</span><span class="detail-val" id="detTimeline"></span></div>
+          <div class="detail-item"><span class="detail-key">Score</span><span class="detail-val" id="detScore"></span></div>
+        </div>
+        <h4 class="conversation-title">Units offered</h4>
+        <div class="matched-units" id="matchedUnits">
+          <p class="matched-units__empty">No units matched yet</p>
+        </div>
+        <h4 class="conversation-title">Conversation</h4>
+        <div class="conversation-thread" id="conversationThread"></div>
+      </div>
+    </div>
+
+    <div class="panel" id="panelFunnel">
+      <h3 class="panel__title">Funnel drop-off</h3>
+      <div class="funnel-bars" id="funnelBars"></div>
+    </div>
+
+    <div class="panel" id="panelActivity">
+      <h3 class="panel__title">Recent activity</h3>
+      <div class="activity-feed" id="activityFeed">
+        <div class="activity-placeholder">No activity yet</div>
+      </div>
+    </div>
+
+  </aside>
+</main>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

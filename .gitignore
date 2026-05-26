@@ -1,0 +1,45 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Environment Variables
+.env
+*.env
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs and Temporary files
+*.log
+*.txt
+*.json
+!README.md
+!openapi.json
+!package.json
+!tsconfig.json
+
+# Exclude specific temp logs/outputs
+celery.log
+error.txt
+server_check.log
+tb.log
+tunnel.log
+uvicorn_logs.txt
+out.json
+out2.json
+webhook_info.json
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Misc
+.vscode/
+.idea/

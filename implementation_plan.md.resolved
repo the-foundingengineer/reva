@@ -1,0 +1,422 @@
+# Reva Full System — Implementation Plan
+
+This document details every change required to bring the existing Reva codebase (FastAPI + Celery + Redis + Supabase + Claude/Ollama) to the complete 10-layer architecture described in the specification.
+
+---
+
+## Current State (What Already Exists)
+
+| Layer | Status | What's Built |
+|---|---|---|
+| Lead Ingestion | 🟡 Partial | WhatsApp (360dialog, Evolution), Telegram webhook parsers. No unified gateway, no signature verification |
+| Task Queue | 🟢 Done | Celery + Redis broker. Basic retry (3 retries, flat 5s). Idempotency via Redis |
+| AI Core | 🟢 Done | Claude Sonnet + Ollama with tool calling (search_inventory, book_meeting, send_properties). System prompt as "Amara Okonkwo" |
+| Intelligence | 🟡 Partial | Lagos-aware inventory search with ±20% budget flexibility. LLM-based seriousness scoring. No behavioural scoring, no anti-hallucination monitor |
+| Data Layer | 🟢 Done | Supabase (leads, properties, units, agents, tenants, developments) + Redis cache (history, stage, lead data, matches). RLS enabled but no policies |
+| Routing & Handoff | 🟡 Partial | Round-robin agent assignment. Score-based routing stub. CLOSED/PAUSE/RESUME commands. No TAKEOVER/HANDBACK/STATUS |
+| Background Jobs | 🟡 Partial | Nurture job (daily 10am, 3/7/14-day). No resurrection, portal sync, or ROI report jobs |
+| Observability | 🟡 Partial | Health endpoint (Redis + Supabase + LLM breaker). Circuit breakers (LLM, DB). No Prometheus, Grafana, or WhatsApp breaker |
+| Client Surfaces | 🟡 Partial | Static HTML/CSS/JS dashboard with kanban + stats. No Next.js, no admin panel |
+| Infrastructure | 🟡 Partial | 4 SQL migrations, Celery config, APScheduler. No RLS policies, no structured logging |
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Build Sequence Prioritisation**: This plan follows the spec's build sequence (Weeks 3–4 → Month 2 → Month 3). Phases 1–5 are Week 3–4 scope. If you want to reorder or defer any phase, please flag it now.
+
+> [!WARNING]
+> **Breaking Change — Agent Commands**: The current [agent_commands.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/agent_commands.py) uses the lead's phone number. The spec calls for a separate agent control WhatsApp number. This requires distinguishing agent messages from lead messages at the webhook level, which means either a second WhatsApp number or a middleware check against the [agents](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/agent_notify.py#50-52) table.
+
+> [!IMPORTANT]  
+> **Dashboard Rebuild**: The spec calls for a Next.js + Tailwind live dashboard on Vercel. This is a ~full frontend project. The current static HTML dashboard works and could remain as the MVP while the Next.js version is built as a separate repo. Do you want the Next.js dashboard as part of this plan or as a separate effort?
+
+> [!IMPORTANT]
+> **Gmail API**: Portal email intercept and ROI reports both require Google Cloud project setup + OAuth credentials. These are infrastructure pre-requisites you'll need to provision. Same for Vapi.ai and Meta Graph API keys.
+
+---
+
+## Proposed Changes
+
+### Phase 1 — Core Infrastructure Hardening
+
+This phase makes the ingestion pipeline robust by adding the unified gateway, signature verification, proper retry policies, and moving rate-limiting/dedup to the gateway level.
+
+---
+
+#### [NEW] [gateway.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/webhooks/gateway.py)
+
+The unified ingestion gateway. Single entry point for all channels. Does five things before any message touches the AI:
+
+1. **Normalise**: Convert any source-specific payload into [IncomingMessage](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/models/lead.py#21-28)
+2. **Deduplicate**: Check `msg:{message_id}` key in Redis (1-hour TTL)
+3. **Rate limit**: 10 messages per 60 seconds per phone number (already in [redis.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/cache/redis.py), wired in here)
+4. **Verify signature**: HMAC validation per provider (360dialog, Evolution, Telegram)
+5. **Dispatch**: Drop to Celery queue, return 200
+
+This replaces the duplicated dispatch logic currently in [whatsapp.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/webhooks/whatsapp.py) (lines 146–195) and [telegram.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/webhooks/telegram.py).
+
+---
+
+#### [MODIFY] [whatsapp.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/webhooks/whatsapp.py)
+
+- Remove Celery dispatch logic from [whatsapp_360dialog_webhook](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/webhooks/whatsapp.py#146-170) and [whatsapp_evolution_webhook](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/webhooks/whatsapp.py#172-196)
+- Both routes call `gateway.ingest()` instead
+- Add webhook signature verification middleware (HMAC-SHA256 for 360dialog, custom header for Evolution)
+
+#### [MODIFY] [telegram.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/webhooks/telegram.py)
+
+- Remove Celery dispatch logic
+- Call `gateway.ingest()` with `source="telegram"`
+- Add Telegram bot token signature verification (`X-Telegram-Bot-Api-Secret-Token` header)
+
+#### [MODIFY] [celery_app.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/workers/celery_app.py)
+
+- Add exponential backoff retry policy: `task_default_retry_delay=5`, `task_max_retries=3`
+- Configure dead-letter queue: failed tasks route to `dead_letter` queue
+- Add `task_reject_on_worker_lost=True` for reliability
+
+#### [MODIFY] [tasks.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/workers/tasks.py)
+
+- Update [process_message_task](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/workers/tasks.py#135-145) decorator: `autoretry_for=(Exception,)`, `retry_backoff=5`, `retry_backoff_max=125`
+- Add dead-letter callback: on max retries exceeded, dispatch alert (WhatsApp to on-call number)
+- Remove inline idempotency check (moved to gateway)
+
+#### [MODIFY] [redis.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/cache/redis.py)
+
+- Add `mark_message_processed(message_id)` with 1-hour TTL (gateway dedup)
+- Add `is_message_processed(message_id)` check
+
+---
+
+### Phase 2 — AI Core & Intelligence Services
+
+Adds the anti-hallucination monitor, Whisper voice transcription, behavioural scoring, and the intent extraction service.
+
+---
+
+#### [NEW] [anti_hallucination.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/llm/anti_hallucination.py)
+
+Post-generation checker. Scans Reva's response for:
+- Property names → cross-reference against [properties](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/inventory.py#220-333) and [units](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/routers/inventory.py#14-21) tables
+- Prices (₦ or number patterns) → verify against inventory
+- Locations → verify only mentioned locations that exist in inventory
+
+If hallucination detected, block the response and replace with fallback message pushing toward booking.
+
+#### [NEW] [transcription.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/transcription.py)
+
+Whisper API integration for voice note transcription:
+- Accept audio URL, download media, send to OpenAI Whisper
+- Support English, Nigerian Pidgin, Yoruba, Igbo (via `language` hint)
+- Return transcript text that feeds into the conversation as if typed
+- Replace the placeholder `transcribe_voice_note` import in [tasks.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/workers/tasks.py)
+
+#### [NEW] [scoring.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/scoring.py)
+
+Behavioural lead scoring engine. Two signal types:
+- **Conversation score**: Already extracted by LLM as `seriousness_score` (1–10)
+- **Behavioural score**: Calculated from response speed (time between messages), message volume, keyword signals ("payment plan", "C of O", "school nearby", "when can I visit")
+
+Combined score = weighted average. Score determines routing (8+ → senior agent, 5–7 → standard, <5 → nurture).
+
+#### [MODIFY] [extractor.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/extractor.py)
+
+Currently a stub (`# Intent extraction logic\n`). Implement:
+- Intent classification (buying, renting, investing, just browsing)
+- Urgency detection (timeline keywords)
+- Budget extraction from natural language
+- Complement the LLM's `<<<EXTRACTED>>>` block with rule-based fallback
+
+#### [MODIFY] [client.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/llm/client.py)
+
+- Wire `llm_breaker.call()` around [call_claude()](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/llm/client.py#58-101) and [call_ollama()](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/llm/client.py#40-56) in [get_ai_response](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/llm/client.py#202-302)
+- Add anti-hallucination check after response generation, before returning
+- Add structured timing (duration logged on every LLM call)
+
+---
+
+### Phase 3 — Channel Expansion
+
+Adds Vapi voice, Gmail portal intercept, and Instagram DM channels.
+
+---
+
+#### [NEW] [vapi.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/webhooks/vapi.py)
+
+Vapi.ai voice inbound webhook:
+- Receive call events (call.started, transcription, call.ended)
+- First 2 minutes: qualification via Reva prompt
+- Auto-book if qualified, or live-transfer to agent
+- Transcript feeds into conversation context like a normal message
+
+#### [NEW] [portal_intercept.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/portal_intercept.py)
+
+Gmail API integration for PropertyPro / Nigeria Property Centre:
+- Poll inbox for emails matching sender patterns
+- Parse lead phone number from email body (regex patterns)
+- Extract property interest from email subject/body
+- Initiate WhatsApp outreach within 60 seconds via [send_outbound_message](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/messaging.py#101-116)
+- Mark email as read to avoid re-processing
+
+#### [NEW] [instagram.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/webhooks/instagram.py)
+
+Meta Graph API webhook for Instagram DMs:
+- Receive `messaging` events from Instagram webhook
+- Parse into [IncomingMessage](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/models/lead.py#21-28) via `gateway.ingest()`
+- Responses sent back via Instagram Send API
+
+#### [MODIFY] [messaging.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/messaging.py)
+
+- Add `send_instagram_message(ig_user_id, text)` function
+- Add `send_vapi_response()` for voice channel responses
+- Update [send_outbound_message](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/messaging.py#101-116) router for new sources: `"instagram"`, `"vapi"`, `"portal_email"`
+
+---
+
+### Phase 4 — Agent Management & Routing
+
+Full agent command set + calendar booking engine + development-scoped routing.
+
+---
+
+#### [MODIFY] [agent_commands.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/agent_commands.py)
+
+Add missing commands:
+- `TAKEOVER <phone>`: Set lead as agent-active in Redis + DB. Reva stops responding to that lead.
+- `HANDBACK <phone>`: Clear agent-active flag. Reva resumes with full context.
+- `STATUS`: Return today's stats (leads received, qualified, meetings booked, deals closed)
+- `CLOSED <phone> <amount>`: Already exists. Add revenue dashboard update.
+
+#### [NEW] [google_calendar.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/google_calendar.py)
+
+Google Calendar API integration (complements existing Calendly):
+- Create events on agent's Google Calendar
+- 3-slot offer within WhatsApp (already in [calendar.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/calendar.py) but with mock slots)
+- Actual free/busy lookup via Google Calendar API
+- Confirmation message to lead + briefing message to agent
+
+#### [MODIFY] [agent_notify.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/agent_notify.py)
+
+- [assign_agent()](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/agent_notify.py#44-76): Scope to development (currently global round-robin)
+- Add fallback: if no agent for development, route to any active agent
+- Score-based override: 8+ goes to `senior_agent` field on agent record
+- Send agent briefing with full lead profile on assignment
+
+---
+
+### Phase 5 — Background Jobs
+
+Three new scheduled jobs + centralised scheduler.
+
+---
+
+#### [NEW] [resurrection.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/jobs/resurrection.py)
+
+Weekly Monday 9am job:
+- Find leads with >=60 days inactivity, not booked, not closed
+- Send re-engagement message referencing market changes or new inventory in their location
+- Template library similar to nurture messages
+
+#### [NEW] [portal_sync.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/jobs/portal_sync.py)
+
+Every 15 minutes:
+- Call `portal_intercept.py` to poll Gmail inbox
+- Extract new leads from PropertyPro / Nigeria Property Centre emails
+- Deduplicate against existing leads by phone number
+- Initiate WhatsApp outreach for new leads
+
+#### [NEW] [roi_report.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/jobs/roi_report.py)
+
+Weekly Sunday 8pm:
+- Query `revenue_intelligence` view from Supabase
+- Generate plain-English email report (leads, qualified, booked, closed, revenue)
+- Send via Gmail API or SendGrid to developer management team emails
+- Designed to be board-forwardable
+
+#### [MODIFY] [nurture.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/jobs/nurture.py)
+
+- Extract scheduler into a shared `scheduler.py` module
+- Register all four jobs (nurture, resurrection, portal_sync, roi_report) in one scheduler
+- All jobs scoped to Africa/Lagos timezone
+
+#### [NEW] [scheduler.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/jobs/scheduler.py)
+
+Centralised APScheduler process:
+- Replaces [start_scheduler()](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/jobs/nurture.py#78-89) from [nurture.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/jobs/nurture.py)
+- Registers: nurture (daily 10am), resurrection (Monday 9am), portal_sync (every 15min), roi_report (Sunday 8pm)
+- Single entry point for [main.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/main.py) lifespan
+
+---
+
+### Phase 6 — Client Surfaces
+
+This is a significant build. The Next.js dashboard and admin panel are separate frontend projects.
+
+---
+
+#### [NEW] Next.js Dashboard (separate directory or repo)
+
+- Pipedrive-style kanban board with drag-drop stages
+- KPI bar (total leads, qualified, booked, conversion rate, revenue projection)
+- Funnel drop-off visualization
+- Real-time activity feed (Supabase Realtime)
+- Lead detail view with conversation transcript
+- Revenue projection chart
+- Polls `/api/leads`, `/api/stats` every 30 seconds
+
+> This is a large standalone build. Recommend deferring to Phase 6 while the static dashboard continues to serve.
+
+#### [NEW] Admin Panel (within Next.js or separate)
+
+- CRUD for property listings (add, edit, remove, upload images)
+- Agent profile management (add/remove, toggle active, set development)
+- Development management (add/remove, configure pricing)
+- Reva personality customisation per tenant (custom prompt additions)
+- No developer involvement after initial setup
+
+---
+
+### Phase 7 — Observability & Reliability
+
+---
+
+#### [MODIFY] [logger.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/core/logger.py)
+
+- Switch to structured JSON logging (currently plain text format)
+- Every log includes: `tenant_id`, `phone_hash`, [stage](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/cache/redis.py#66-68), `duration_ms`, `event_type`
+- Railway-compatible JSON format for log drain
+
+#### [NEW] [metrics.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/core/metrics.py)
+
+Prometheus metrics module:
+- `reva_messages_total` (counter by source, stage)
+- `reva_llm_duration_seconds` (histogram p50/p95/p99)
+- `reva_lead_conversion` (gauge by stage)
+- `reva_tool_calls_total` (counter by tool, success/fail)
+- `reva_queue_depth` (gauge)
+- `/metrics` endpoint for Prometheus scraping
+
+#### [MODIFY] [circuit_breaker.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/core/circuit_breaker.py)
+
+- Add `whatsapp_breaker = CircuitBreaker("whatsapp", failure_threshold=5, recovery_timeout=60)`
+- Wire into [send_outbound_message()](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/services/messaging.py#101-116) for all WhatsApp providers
+- Add metrics emission on state transitions
+
+#### [MODIFY] [health.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/routers/health.py)
+
+- Add Celery worker heartbeat check
+- Add WhatsApp provider connectivity check
+- Return structured response matching UptimeRobot expectations
+- Add WhatsApp alert on health degradation
+
+---
+
+### Phase 8 — Multi-Tenancy & Security
+
+---
+
+#### [NEW] [005_rls_policies.sql](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/migrations/005_rls_policies.sql)
+
+Actual RLS policies (currently only `ENABLE ROW LEVEL SECURITY`, no policies defined):
+```sql
+CREATE POLICY tenant_leads ON leads FOR ALL
+  USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+-- Repeat for properties, agents, developments, conversation_logs
+```
+
+#### [NEW] [tenant_middleware.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/core/tenant_middleware.py)
+
+FastAPI middleware that:
+- Extracts `tenant_id` from JWT / API key / webhook configuration
+- Sets `app.current_tenant_id` on every Supabase query
+- Ensures cross-tenant data isolation at the API level
+
+#### [MODIFY] [supabase.py](file:///c:/Users/ZBOOK%20STUDIO%20G5/Documents/dev/reva/app/db/supabase.py)
+
+- Add `set_tenant_context(tenant_id)` helper called before queries
+- RPC call to `SET LOCAL app.current_tenant_id = ...`
+
+---
+
+## Verification Plan
+
+### Existing Tests (Run These First)
+
+The project has 5 test files in `/tests/`:
+
+```powershell
+# Run all existing tests
+cd c:\Users\ZBOOK STUDIO G5\Documents\dev\reva
+python -m pytest tests/ -v
+```
+
+| Test File | Covers |
+|---|---|
+| `test_redis.py` | Redis connection, conversation CRUD, rate limiting, dedup |
+| `test_webhook.py` | WhatsApp payload parsing (360dialog, Evolution) |
+| `test_inventory.py` | Budget parsing, location search, unit matching |
+| `test_humanize.py` | AI output sanitization |
+| `simulate_webhook.py` | End-to-end webhook simulation (manual run) |
+
+### Proposed New Tests
+
+#### Phase 1 — Gateway Tests
+- **File**: `tests/test_gateway.py`
+- Test `IncomingMessage` normalisation from each source
+- Test dedup rejection (same message_id → skip)
+- Test rate limiting (11th message in 60s → rejected)
+- Test signature verification (valid/invalid HMAC)
+- **Run**: `python -m pytest tests/test_gateway.py -v`
+
+#### Phase 2 — AI Intelligence Tests
+- **File**: `tests/test_anti_hallucination.py`
+- Test: response mentioning fake property → blocked
+- Test: response mentioning real property → passes
+- Test: response with no property details → passes
+- **Run**: `python -m pytest tests/test_anti_hallucination.py -v`
+
+- **File**: `tests/test_scoring.py`
+- Test behavioural score calculation
+- Test combined score routing (8+ → hot, 5–7 → warm, <5 → cold)
+- **Run**: `python -m pytest tests/test_scoring.py -v`
+
+#### Phase 4 — Agent Command Tests
+- **File**: `tests/test_agent_commands.py`
+- Test TAKEOVER/HANDBACK flow
+- Test STATUS returns correct stats
+- Test CLOSED records revenue
+- **Run**: `python -m pytest tests/test_agent_commands.py -v`
+
+### Manual Verification
+
+> [!NOTE]
+> Some integrations require external services and API keys. These must be verified manually with credentials.
+
+1. **Webhook simulation**: Use `python tests/simulate_webhook.py` to send test messages through each channel
+2. **Health check**: `curl http://localhost:8000/api/health` — verify all systems show "ok"
+3. **Dashboard**: Open `http://localhost:8000/dashboard` — verify leads render, stats update
+4. **Celery**: Start celery worker (`celery -A app.workers.celery_app worker --loglevel=info`) and confirm tasks process
+
+### Integration Testing (Deferred)
+- Full pipeline test: webhook → gateway → Celery → AI → response → send
+- Load testing with multiple simulated concurrent leads
+- Multi-tenant isolation verification
+
+---
+
+## Implementation Order
+
+```
+Phase 1 → Infrastructure (gateway, retry, dedup, signatures)
+Phase 2 → AI (anti-hallucination, transcription, scoring)  
+Phase 4 → Agent commands (TAKEOVER/HANDBACK/STATUS)
+Phase 5 → Background jobs (resurrection, portal sync, ROI report)
+Phase 3 → Channels (Vapi, Gmail, Instagram) — requires API keys
+Phase 7 → Observability (logging, Prometheus, Grafana)
+Phase 8 → Multi-tenancy (RLS policies, tenant middleware)
+Phase 6 → Client surfaces (Next.js dashboard, admin panel) — largest effort, last
+```
+
+> Phases 1–2 and 4–5 are the highest-impact, lowest-risk work. Phase 3 and 6 depend on external API provisioning. Phase 7–8 are hardening.
