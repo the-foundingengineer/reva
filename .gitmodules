@@ -1,0 +1,3 @@
+[submodule "evolution-api-native"]
+	path = evolution-api-native
+	url = https://github.com/EvolutionAPI/evolution-api.git
